@@ -1,0 +1,36 @@
+name: Sync Fork
+
+on:
+  schedule:
+    # 每7天 UTC 00:00 运行（北京时间约08:00）
+    - cron: "0 0 */7 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/cmliu/CF-Workers-WebSSH.git
+          git fetch upstream
+
+      - name: Sync main
+        run: |
+          git checkout main
+          git merge upstream/main --ff-only
+          git push origin main
