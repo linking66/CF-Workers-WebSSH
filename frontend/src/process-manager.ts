@@ -50,9 +50,21 @@ interface ProcessSnapshot {
     loadAverage: [number, number, number] | null;
     memory: ResourceUsage | null;
     swap: ResourceUsage | null;
+    network: NetworkSample[] | null;
   };
   processes: ProcessEntry[];
   timestamp: number;
+}
+
+// Per-interface cumulative-byte network samples for the current tick. The
+// server forwards the raw counters for every non-virtual interface (capped at
+// MAX_NETWORK_INTERFACES); the frontend differentiates two successive samples
+// of the selected interface with a local clock to compute the upload /
+// download rate that drives the sparkline.
+export interface NetworkSample {
+  iface: string;
+  rxBytes: number;
+  txBytes: number;
 }
 
 interface PendingKillContext {
@@ -76,9 +88,19 @@ interface ProcessManagerOptions {
   onError: (message: string) => void;
   onReconnect?: (zh: string, en: string) => void;
   onToast?: (zh: string, en: string, kind: 'info' | 'error') => void;
+  // Fired once per validated snapshot, even when the server didn't return a
+  // network sample. The frontend uses the local clock + successive samples to
+  // derive the per-interface upload / download rate; the first sample of the
+  // selected interface is the baseline (rate shows zero) and the next one
+  // starts drawing the sparkline.
+  onNetworkSample?: (samples: NetworkSample[] | null, timestamp: number) => void;
 }
 
 const MAX_PROCESSES = 512;
+// Upper bound on the number of network interface samples the backend may emit
+// per tick. Mirrors the shell/parser cap (src/backend) so a hostile or
+// misbehaving host cannot flood the frontend with rows.
+const MAX_NETWORK_INTERFACES = 32;
 // Auto-reconnect backoff for the process monitor after an unexpected drop.
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 15_000;
@@ -98,6 +120,23 @@ function isUsage(value: unknown): value is ResourceUsage {
   return typeof usage.usedBytes === 'number' && Number.isFinite(usage.usedBytes) && usage.usedBytes >= 0
     && typeof usage.totalBytes === 'number' && Number.isFinite(usage.totalBytes) && usage.totalBytes >= usage.usedBytes
     && finitePercent(usage.percent) && usage.percent <= 100;
+}
+
+function isNetworkSample(value: unknown): value is NetworkSample {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const sample = value as Partial<NetworkSample>;
+  return typeof sample.iface === 'string' && sample.iface.length > 0 && sample.iface.length <= 64
+    && typeof sample.rxBytes === 'number' && Number.isSafeInteger(sample.rxBytes) && sample.rxBytes >= 0
+    && typeof sample.txBytes === 'number' && Number.isSafeInteger(sample.txBytes) && sample.txBytes >= 0;
+}
+
+// Guards a validated list of network samples: an array of at most
+// MAX_NETWORK_INTERFACES entries, each passing the single-sample guard.
+// The length cap mirrors the backend's shell/parser cap.
+export function isNetworkSampleList(value: unknown): value is NetworkSample[] {
+  return Array.isArray(value)
+    && value.length <= MAX_NETWORK_INTERFACES
+    && value.every(isNetworkSample);
 }
 
 function isProcess(value: unknown): value is ProcessEntry {
@@ -124,7 +163,8 @@ function isSnapshot(value: unknown): value is ProcessSnapshot {
     && (metrics!.cpuPercent === null || finitePercent(metrics!.cpuPercent))
     && (metrics!.loadAverage === null || (Array.isArray(metrics!.loadAverage) && metrics!.loadAverage.length === 3 && metrics!.loadAverage.every(finitePercent)))
     && (metrics!.memory === null || isUsage(metrics!.memory))
-    && (metrics!.swap === null || isUsage(metrics!.swap));
+    && (metrics!.swap === null || isUsage(metrics!.swap))
+    && (metrics!.network === null || isNetworkSampleList(metrics!.network));
 }
 
 function formatPercent(value: number | null): string {
@@ -169,6 +209,7 @@ export class ProcessManager {
   private readonly onError: (message: string) => void;
   private readonly onReconnect: ((zh: string, en: string) => void) | undefined;
   private readonly onToast: ((zh: string, en: string, kind: 'info' | 'error') => void) | undefined;
+  private readonly onNetworkSample: ((samples: NetworkSample[] | null, timestamp: number) => void) | undefined;
   private socket: WebSocket | null = null;
   private generation = 0;
   private snapshot: ProcessSnapshot | null = null;
@@ -194,6 +235,7 @@ export class ProcessManager {
     this.onError = options.onError;
     this.onReconnect = options.onReconnect;
     this.onToast = options.onToast;
+    this.onNetworkSample = options.onNetworkSample;
     this.elements.panel.addEventListener('click', (event) => {
       const target = event.target as HTMLElement;
       const sortButton = target.closest<HTMLButtonElement>('[data-process-sort]');
@@ -364,6 +406,11 @@ export class ProcessManager {
     if (isSnapshot(message)) {
       this.snapshot = message;
       this.render();
+      // Fire after render so the parent can update dependent UI (sparkline
+      // canvas, network block visibility) using a fresh, validated sample.
+      // The callback is invoked even when network is null so the frontend
+      // can decide whether to hide the block on its own.
+      this.onNetworkSample?.(message.metrics.network, message.timestamp);
       return;
     }
     if (!message || typeof message !== 'object' || Array.isArray(message)) return;

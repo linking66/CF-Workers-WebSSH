@@ -8,7 +8,7 @@ import { resolveConnectionControl, resolveConnectionPanel } from './ui-state';
 import { classifyHostKey, SSH_FINGERPRINT_RE, type HostKeyPrompt } from './host-key';
 import { FileManager, collectFileManagerElements } from './file-manager';
 import { FileTree } from './file-tree';
-import { ProcessManager, collectProcessManagerElements } from './process-manager';
+import { ProcessManager, collectProcessManagerElements, type NetworkSample } from './process-manager';
 import { resetTerminalForConnection } from './terminal-session';
 import './style.css';
 
@@ -281,9 +281,14 @@ const ui = {
   sessionSubtitle: element<HTMLElement>('session-subtitle'),
   liveOrb: element<HTMLElement>('live-orb'),
   liveOrbLabel: element<HTMLElement>('live-orb-label'),
-  metricRtt: element<HTMLElement>('metric-rtt'),
   metricUptime: element<HTMLElement>('metric-uptime'),
   metricHostKey: element<HTMLElement>('metric-host-key'),
+  resourceNetwork: element<HTMLElement>('resource-network'),
+  resourceNetworkIface: element<HTMLElement>('resource-network-iface'),
+  resourceNetworkSelect: element<HTMLSelectElement>('resource-network-select'),
+  resourceNetworkRateUp: element<HTMLElement>('resource-network-rate-up'),
+  resourceNetworkRateDown: element<HTMLElement>('resource-network-rate-down'),
+  resourceNetworkSparkline: element<HTMLCanvasElement>('resource-network-sparkline'),
   terminalCard: element<HTMLElement>('terminal-card'),
   terminalStage: element<HTMLElement>('terminal-stage'),
   terminalElement: element<HTMLElement>('terminal'),
@@ -379,7 +384,6 @@ let connectionState: ConnectionState = 'idle';
 let sessionStartedAt = 0;
 let uptimeTimer: number | null = null;
 let pingTimer: number | null = null;
-let lastPingAt = 0;
 let pendingHostKey: HostKeyPrompt | null = null;
 let currentTargetKey = '';
 let currentTargetLabel = '';
@@ -407,6 +411,229 @@ let panelOpen = false;
 let fileManager: FileManager;
 let fileTree: FileTree;
 let processManager: ProcessManager;
+
+// Network rate state. The backend sends cumulative byte counters per interface
+// per tick; we keep a per-interface baseline (counters + local clock timestamp)
+// so switching the selected interface — or the server reporting a different
+// set — never produces a bogus one-shot rate spike. `netIfaceList` is the
+// deduplicated, order-preserving list of interfaces present in the latest tick;
+// `netSelectedIface` stays null until the first tick resolves a default.
+// 60-point ring buffer of the per-tick throughput magnitude (max of rx/tx).
+// The newest sample lives at `netSparkIdx - 1`; the oldest at `netSparkIdx`
+// once the buffer wraps, or at index 0 while it is still filling.
+const NET_SPARK_POINTS = 60;
+const netSpark = new Float32Array(NET_SPARK_POINTS);
+let netSparkIdx = 0;
+let netSparkFilled = 0;
+const netBaselines = new Map<string, { rx: number; tx: number; ts: number }>();
+let netIfaceList: string[] = [];
+let netSelectedIface: string | null = null;
+
+const NET_RATE_UNITS = ['B', 'KB', 'MB', 'GB'] as const;
+
+function formatNetworkRate(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B/s';
+  let v = value;
+  let unitIndex = 0;
+  while (v >= 1024 && unitIndex < NET_RATE_UNITS.length - 1) {
+    v /= 1024;
+    unitIndex += 1;
+  }
+  const text = v < 10 ? v.toFixed(1) : v.toFixed(0);
+  return `${text}${NET_RATE_UNITS[unitIndex]}/s`;
+}
+
+function drawNetworkSparkline(): void {
+  const canvas = ui.resourceNetworkSparkline;
+  const dpr = window.devicePixelRatio && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+  // Use clientWidth (CSS px) scaled by DPR for the backing store, so the
+  // bitmap stays crisp on Hi-DPI displays without forcing the parent layout.
+  const cssWidth = canvas.clientWidth || 184;
+  const cssHeight = canvas.clientHeight || 22;
+  const width = Math.max(1, Math.round(cssWidth * dpr));
+  const height = Math.max(1, Math.round(cssHeight * dpr));
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.clearRect(0, 0, width, height);
+  if (netSparkFilled === 0) return;
+  // Build a chronological copy so the rest of the math is index-stable.
+  const data = new Array<number>(NET_SPARK_POINTS).fill(0);
+  const start = netSparkFilled < NET_SPARK_POINTS ? 0 : netSparkIdx;
+  for (let i = 0; i < NET_SPARK_POINTS; i += 1) {
+    data[i] = netSpark[(start + i) % NET_SPARK_POINTS];
+  }
+  let minimum = data[0];
+  let maximum = data[0];
+  for (const v of data) {
+    if (v < minimum) minimum = v;
+    if (v > maximum) maximum = v;
+  }
+  // `span = max(mx - mn, 1)` keeps the bar heights defined even when every
+  // sample is identical (all bars collapse to the zero-line without div-by-zero).
+  const span = Math.max(maximum - minimum, 1);
+  const slot = width / NET_SPARK_POINTS;
+  // Leave a small gap between bars; floor so a 1px slot still draws a visible bar.
+  const barWidth = Math.max(1, Math.floor(slot * 0.7));
+  ctx.fillStyle = '#69e6b4';
+  for (let i = 0; i < NET_SPARK_POINTS; i += 1) {
+    const value = data[i];
+    const normalized = (value - minimum) / span;
+    const barHeight = Math.max(1, Math.round(normalized * (height - 1)));
+    const x = Math.round(i * slot + ((slot - barWidth) / 2));
+    const y = height - barHeight;
+    ctx.fillRect(x, y, barWidth, barHeight);
+  }
+}
+
+// Rebuilds the `<select>` options only when the interface list changed, so a
+// rapid tick cannot recreate the element under an open dropdown (which would
+// drop focus). The iface label always follows the currently selected interface.
+function syncNetworkSelectOptions(): void {
+  const select = ui.resourceNetworkSelect;
+  const existing = Array.from(select.options).map((option) => option.value);
+  const unchanged = existing.length === netIfaceList.length
+    && existing.every((value, index) => value === netIfaceList[index]);
+  if (unchanged) return;
+  select.replaceChildren();
+  for (const iface of netIfaceList) {
+    const option = document.createElement('option');
+    option.value = iface;
+    option.textContent = iface;
+    select.append(option);
+  }
+}
+
+// Reflects the current interface list / selection in the toolbar: a single
+// interface keeps the plain-text label, two or more reveal the native select
+// (which itself displays the chosen interface name, so the redundant
+// plain-text label is hidden while the select is shown).
+function updateNetworkIfaceLabel(): void {
+  const select = ui.resourceNetworkSelect;
+  const multi = netIfaceList.length > 1;
+  ui.resourceNetworkIface.textContent = netSelectedIface ?? '-';
+  ui.resourceNetworkIface.hidden = multi;
+  select.hidden = !multi;
+  if (multi) {
+    syncNetworkSelectOptions();
+    select.value = netSelectedIface ?? '';
+  }
+}
+
+// Sole entry point for resetting the rate baseline. Called on interface
+// switch (manual or automatic fallback) and on full teardown; do NOT clear
+// baseline state by hand anywhere else.
+function resetNetworkBaseline(): void {
+  netBaselines.clear();
+  netSpark.fill(0);
+  netSparkIdx = 0;
+  netSparkFilled = 0;
+  drawNetworkSparkline();
+  ui.resourceNetworkRateUp.textContent = `↑ ${formatNetworkRate(0)}`;
+  ui.resourceNetworkRateDown.textContent = `↓ ${formatNetworkRate(0)}`;
+}
+
+function updateNetworkMetric(samples: NetworkSample[] | null, timestamp: number): void {
+  if (!samples || samples.length === 0) {
+    // The server may briefly stop sending a network section (e.g. busybox
+    // sh without /sys/class/net). Don't tear down the toolbar block on a
+    // single missing tick — only reset on a full teardown. The next valid
+    // sample will overwrite the UI state.
+    return;
+  }
+  if (ui.resourceNetwork.hidden) ui.resourceNetwork.hidden = false;
+
+  // Deduplicated, order-preserving interface list for this tick. A tick may
+  // carry the same interface twice (server fallback); only the first
+  // occurrence is kept so the selector stays stable.
+  const list: string[] = [];
+  const seen = new Set<string>();
+  for (const sample of samples) {
+    if (seen.has(sample.iface)) continue;
+    seen.add(sample.iface);
+    list.push(sample.iface);
+  }
+  netIfaceList = list;
+
+  // Resolve the selected interface: keep the user's choice while it is still
+  // present, otherwise fall back to eth0 (or the first interface in order).
+  const previousSelection = netSelectedIface;
+  if (netSelectedIface === null || !netIfaceList.includes(netSelectedIface)) {
+    netSelectedIface = netIfaceList.includes('eth0') ? 'eth0' : netIfaceList[0];
+  }
+  if (netSelectedIface !== previousSelection) {
+    // Interface changed (user switch or automatic fallback): a fresh baseline
+    // prevents a bogus one-shot rate spike across different counters.
+    resetNetworkBaseline();
+  }
+
+  // Prune baselines for interfaces that disappeared (e.g. cable unplugged).
+  for (const iface of netBaselines.keys()) {
+    if (!netIfaceList.includes(iface)) netBaselines.delete(iface);
+  }
+
+  const selected = netSelectedIface;
+  const sample = samples.find((entry) => entry.iface === selected);
+  if (!sample) {
+    // The selected interface is absent from this tick (mid-switch); keep the
+    // current UI until the next tick provides it again.
+    return;
+  }
+
+  const baseline = netBaselines.get(selected);
+  if (!baseline) {
+    // First sample for the selected interface: stash the counters and
+    // timestamp; rate and sparkline both show zero until we have a second
+    // sample to diff against.
+    netBaselines.set(selected, { rx: sample.rxBytes, tx: sample.txBytes, ts: timestamp });
+    drawNetworkSparkline();
+    ui.resourceNetworkRateUp.textContent = `↑ ${formatNetworkRate(0)}`;
+    ui.resourceNetworkRateDown.textContent = `↓ ${formatNetworkRate(0)}`;
+    updateNetworkIfaceLabel();
+    return;
+  }
+
+  // `timestamp` is in milliseconds; clamp to a tiny positive value so a
+  // pathological zero/negative delta (rare clock skew) cannot divide-by-zero
+  // or produce an infinite rate.
+  const deltaSeconds = Math.max(0.001, (timestamp - baseline.ts) / 1000);
+  const deltaRx = Math.max(0, sample.rxBytes - baseline.rx);
+  const deltaTx = Math.max(0, sample.txBytes - baseline.tx);
+  const rxRate = deltaRx / deltaSeconds;
+  const txRate = deltaTx / deltaSeconds;
+  netBaselines.set(selected, { rx: sample.rxBytes, tx: sample.txBytes, ts: timestamp });
+  // Use the larger of the two rates as the sparkline magnitude so a
+  // quiescent direction doesn't make the chart look half-dead.
+  const magnitude = Math.max(rxRate, txRate);
+  netSpark[netSparkIdx] = magnitude;
+  netSparkIdx = (netSparkIdx + 1) % NET_SPARK_POINTS;
+  if (netSparkFilled < NET_SPARK_POINTS) netSparkFilled += 1;
+  drawNetworkSparkline();
+  // `↑` = upload (tx), `↓` = download (rx) — match the toolbar arrow convention.
+  ui.resourceNetworkRateUp.textContent = `↑ ${formatNetworkRate(txRate)}`;
+  ui.resourceNetworkRateDown.textContent = `↓ ${formatNetworkRate(rxRate)}`;
+  updateNetworkIfaceLabel();
+}
+
+function resetNetworkMetric(): void {
+  // Idempotent: only touch the DOM / state if the block is currently visible
+  // or still carries live state, so repeated resets (one per
+  // processManager.reset() call site) are cheap.
+  if (ui.resourceNetwork.hidden && netSelectedIface === null && netBaselines.size === 0) return;
+  ui.resourceNetwork.hidden = true;
+  netIfaceList = [];
+  netSelectedIface = null;
+  const select = ui.resourceNetworkSelect;
+  select.replaceChildren();
+  select.hidden = true;
+  // Restore the default single-card presentation: the plain-text label is
+  // visible again and the select is hidden, so a fresh session starts from a
+  // clean state regardless of the previous multi-card visibility toggle.
+  ui.resourceNetworkIface.hidden = false;
+  ui.resourceNetworkIface.textContent = '-';
+  resetNetworkBaseline();
+}
 
 const terminal = new Terminal({
   allowProposedApi: false,
@@ -446,6 +673,7 @@ processManager = new ProcessManager({
   onError: (message) => event(message, 'process', true),
   onReconnect: (zh, en) => event(bilingual(zh, en), 'process'),
   onToast: (zh, en, kind) => toast(bilingual(zh, en), kind),
+  onNetworkSample: (sample, timestamp) => updateNetworkMetric(sample, timestamp),
 });
 
 function terminalTheme(): Record<string, string> {
@@ -1188,8 +1416,7 @@ function startTimers(): void {
   uptimeTimer = window.setInterval(updateUptime, 1_000);
   pingTimer = window.setInterval(() => {
     if (socket?.readyState !== WebSocket.OPEN) return;
-    lastPingAt = performance.now();
-    socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+    socket.send(JSON.stringify({ type: 'ping' }));
   }, PING_INTERVAL_MS);
 }
 
@@ -1355,14 +1582,6 @@ function handleServerMessage(message: ServerMessage): void {
     event(bilingual('进程监控通道已可用。', 'Process monitor channel is available.'), 'process');
     return;
   }
-  if (type === 'pong') {
-    if (lastPingAt > 0) ui.metricRtt.textContent = `${Math.max(1, Math.round(performance.now() - lastPingAt))} ms`;
-    return;
-  }
-  if (type === 'rtt') {
-    if (typeof message.latency === 'number') ui.metricRtt.textContent = `${Math.round(message.latency)} ms`;
-    return;
-  }
   if (type === 'host_key') {
     const fingerprint = message.fingerprint ?? '';
     const keyType = message.keyType ?? '';
@@ -1477,6 +1696,7 @@ function failActiveConnection(activeSocket: WebSocket | null, closeReason: strin
   fileManager.reset();
   fileTree?.setReady(false);
   processManager.reset();
+  resetNetworkMetric();
   clearHostKeyPrompt();
   invalidateHistoryPasswordLoad();
   updateConnectionStatus(displayReason);
@@ -1511,6 +1731,9 @@ async function connect(): Promise<void> {
   if (historyPasswordLoading) return;
   historyPasswordLoadGeneration++;
   historyPasswordLoading = false;
+  // Fresh baseline for a new session: the previous run may have left network
+  // state (interface list, baselines) if the user navigated away uncleanly.
+  resetNetworkMetric();
   applyFormDefaults();
   const validationError = validateConnectForm();
   if (validationError) {
@@ -1548,7 +1771,6 @@ async function connect(): Promise<void> {
   decoder = createDecoder(ui.encoding.value);
   ui.sessionTitle.textContent = currentTargetLabel;
   updateConnectionStatus(localized('正在授权 Worker 会话...', 'Authorizing Worker session...'));
-  ui.metricRtt.textContent = '--';
   ui.metricHostKey.textContent = '--';
   event(bilingual(`正在连接 ${currentTargetLabel}`, `Starting ${currentTargetLabel}`), 'connect');
 
@@ -1620,6 +1842,7 @@ async function connect(): Promise<void> {
       fileManager.reset();
       fileTree?.setReady(false);
       processManager.reset();
+      resetNetworkMetric();
       clearHostKeyPrompt();
       invalidateHistoryPasswordLoad();
       const wasActive = connectionState === 'connected';
@@ -1665,6 +1888,7 @@ function disconnect(reason = bilingual('已由用户断开连接', 'Disconnected
   fileManager.reset();
   fileTree?.setReady(false);
   processManager.reset();
+  resetNetworkMetric();
   clearHostKeyPrompt();
   invalidateHistoryPasswordLoad();
   currentExpectedFingerprint = '';
@@ -1946,6 +2170,16 @@ ui.hostKeyDialog.addEventListener('cancel', (cancelEvent) => {
 ui.hostKeyDialog.addEventListener('close', () => {
   sendHostKeyDecision(ui.hostKeyDialog.returnValue === 'accept');
 });
+// Bind the network interface selector once. Options are rebuilt by
+// syncNetworkSelectOptions() only when the interface list changes, so the
+// element keeps focus while the user interacts with it.
+ui.resourceNetworkSelect.addEventListener('change', () => {
+  const next = ui.resourceNetworkSelect.value;
+  if (!next || next === netSelectedIface) return;
+  netSelectedIface = next;
+  resetNetworkBaseline();
+  updateNetworkIfaceLabel();
+});
 terminal.onData(sendTerminalData);
 new ResizeObserver(() => fitTerminal(true)).observe(ui.terminalStage);
 window.addEventListener('beforeunload', () => {
@@ -1953,6 +2187,7 @@ window.addEventListener('beforeunload', () => {
   fileTree?.setReady(false);
   fileTree?.destroy();
   processManager.reset();
+  resetNetworkMetric();
   socket?.close(1000, 'Page closed');
 });
 document.addEventListener('keydown', (keyEvent) => {
