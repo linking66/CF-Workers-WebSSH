@@ -10,6 +10,8 @@ import { FileManager, collectFileManagerElements } from './file-manager';
 import { FileTree } from './file-tree';
 import { ProcessManager, collectProcessManagerElements, type NetworkSample } from './process-manager';
 import { resetTerminalForConnection } from './terminal-session';
+import { WebSocketReconnectManager } from './ws-reconnect';
+import type { ReconnectLogEntry } from './ws-reconnect';
 import './style.css';
 
 type AuthMethod = 'password' | 'publickey';
@@ -411,6 +413,12 @@ let panelOpen = false;
 let fileManager: FileManager;
 let fileTree: FileTree;
 let processManager: ProcessManager;
+let sshReconnectManager: WebSocketReconnectManager | null = null;
+let reconnectParams: {
+  host: string; port: number; username: string; authMethod: string;
+  password?: string; privateKey?: string; pinnedKey?: string;
+  term: string; encoding: string;
+} | null = null;
 
 // Network rate state. The backend sends cumulative byte counters per interface
 // per tick; we keep a per-interface baseline (counters + local clock timestamp)
@@ -1338,6 +1346,7 @@ function setState(state: ConnectionState, label?: string): void {
   ui.connect.querySelector<HTMLElement>('span:last-child')!.textContent = controlLabel;
   ui.connect.setAttribute('aria-label', controlLabel);
   ui.connect.title = currentSessionId || controlLabel;
+  updateMobileToolbarVisibility();
 }
 
 function event(message: string, category = 'session', error = false, alternate?: string): void {
@@ -1725,6 +1734,91 @@ async function issueTicket(signal: AbortSignal): Promise<{ ticket: string; sessi
   return { ticket: payload.ticket, sessionId: payload.sessionId };
 }
 
+/** Factory that builds a fresh SSH WebSocket for reconnection attempts. */
+function createSshReconnectFactory(): (attempt: number) => Promise<WebSocket> {
+  return async (attempt: number): Promise<WebSocket> => {
+    const params = reconnectParams!;
+    const abortController = new AbortController();
+    const { ticket, sessionId } = await issueTicket(abortController.signal);
+    currentSessionId = sessionId;
+
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = new URL('/api/ssh', location.href);
+    url.protocol = protocol;
+    url.searchParams.set('ticket', ticket);
+    url.searchParams.set('session', sessionId);
+
+    const generation = ++connectGeneration;
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+
+    ws.addEventListener('open', () => {
+      if (generation !== connectGeneration) {
+        ws.close(1000, 'Connection superseded');
+        return;
+      }
+      // Reset terminal for the new session.
+      resetTerminalForConnection(terminal);
+      fitTerminal(true);
+
+      const config: ConnectionConfig = {
+        type: 'connect',
+        host: params.host,
+        port: params.port,
+        username: params.username,
+        authMethod: params.authMethod as AuthMethod,
+        cols: terminal.cols,
+        rows: terminal.rows,
+        term: params.term,
+      };
+      if (params.authMethod === 'password') config.password = params.password;
+      else config.privateKey = params.privateKey;
+      if (params.pinnedKey) config.expectedFingerprint = params.pinnedKey;
+
+      ws.send(JSON.stringify(config));
+      updateConnectionStatus(localized('正在打开 TCP 连接...', 'Opening TCP connection...'));
+      event(bilingual('WebSocket 已建立，正在打开 SSH 传输（自动重连）。', 'WebSocket established; opening SSH transport (auto-reconnect).'), 'transport');
+    }, { once: true });
+
+    ws.addEventListener('message', (socketEvent) => {
+      void handleSocketData(socketEvent.data as string | ArrayBuffer | Blob, ws, generation);
+    });
+
+    ws.addEventListener('error', () => {
+      if (socket !== ws) return;
+      const message = localized('WebSocket 传输错误。', 'WebSocket transport error.');
+      event(localize(message), 'transport', true);
+    });
+
+    socket = ws;
+    currentExpectedFingerprint = params.pinnedKey ?? '';
+    decoder = createDecoder(params.encoding);
+    return ws;
+  };
+}
+
+/** Handles reconnect lifecycle events and updates the SSH UI accordingly. */
+function handleSshReconnectLog(entry: ReconnectLogEntry): void {
+  if (entry.event === 'give_up') {
+    // Reconnect exhausted — perform full cleanup that was deferred.
+    const reason = bilingual('SSH 重连失败，已达最大重试次数。', 'SSH reconnect failed; maximum retries reached.');
+    event(reason, 'disconnect', true);
+    updateConnectionStatus(messageTranslation(reason));
+    setState('error');
+    toast(reason, 'error');
+    fileManager.reset();
+    fileTree?.setReady(false);
+    processManager.reset();
+  } else if (entry.event === 'reconnect_attempt') {
+    updateConnectionStatus(localized(
+      `正在重连 SSH（${entry.attempt}/${entry.maxAttempts}）…`,
+      `Reconnecting SSH (${entry.attempt}/${entry.maxAttempts})…`,
+    ));
+  } else if (entry.event === 'reconnect_success') {
+    event(bilingual('SSH 重连成功。', 'SSH reconnected successfully.'), 'connect');
+  }
+}
+
 async function connect(): Promise<void> {
   if (connectionState === 'connecting' || connectionState === 'connected' || connectionState === 'disconnecting') return;
   if (socket || authorizationAbort) return;
@@ -1797,6 +1891,22 @@ async function connect(): Promise<void> {
     const activeSocket = new WebSocket(url);
     socket = activeSocket;
     activeSocket.binaryType = 'arraybuffer';
+
+    // Persist connection parameters so the reconnect factory can reuse them.
+    reconnectParams = { host, port, username, authMethod: method, term, encoding: ui.encoding.value };
+    if (method === 'password') reconnectParams.password = password;
+    else reconnectParams.privateKey = privateKey;
+    if (pinnedKey) reconnectParams.pinnedKey = pinnedKey;
+
+    // Set up (or replace) the SSH reconnect manager.
+    sshReconnectManager?.reset();
+    sshReconnectManager = new WebSocketReconnectManager({
+      id: 'SSH',
+      onConnect: createSshReconnectFactory(),
+      onLog: handleSshReconnectLog,
+    });
+    sshReconnectManager.attach(activeSocket);
+
     activeSocket.addEventListener('open', () => {
       if (socket !== activeSocket || generation !== connectGeneration) {
         activeSocket.close(1000, 'Connection attempt superseded');
@@ -1838,6 +1948,26 @@ async function connect(): Promise<void> {
       pendingHistory = null;
       currentExpectedFingerprint = '';
       currentRememberedFingerprint = '';
+      const wasActive = connectionState === 'connected';
+      const isUnexpected = closeEvent.code !== 1000 && closeEvent.code !== 1005;
+
+      if (isUnexpected && sshReconnectManager) {
+        // The reconnect manager will attempt reconnection autonomously.
+        // Skip tearing down child connections — they each have their own
+        // reconnect logic that fires independently.
+        stopTimers();
+        resetNetworkMetric();
+        clearHostKeyPrompt();
+        invalidateHistoryPasswordLoad();
+        const reason = bilingual('SSH 连接断开，正在重连…', 'SSH connection lost; reconnecting…');
+        event(reason, 'disconnect', true);
+        updateConnectionStatus(messageTranslation(reason));
+        setState('connecting');
+        if (wasActive) toast(reason, 'error');
+        return;
+      }
+
+      // Normal close or reconnect not available — full cleanup.
       stopTimers();
       fileManager.reset();
       fileTree?.setReady(false);
@@ -1845,16 +1975,15 @@ async function connect(): Promise<void> {
       resetNetworkMetric();
       clearHostKeyPrompt();
       invalidateHistoryPasswordLoad();
-      const wasActive = connectionState === 'connected';
       const reason = closeEvent.reason
         ? bilingualServerMessage(closeEvent.reason)
         : closeEvent.code === 1000
           ? bilingual('会话已关闭。', 'Session closed.')
           : bilingual(`会话已关闭（${closeEvent.code}）。`, `Session closed (${closeEvent.code}).`);
-      event(reason, 'disconnect', closeEvent.code !== 1000 && closeEvent.code !== 1005);
+      event(reason, 'disconnect', isUnexpected);
       updateConnectionStatus(messageTranslation(reason));
-      setState(closeEvent.code === 1000 || closeEvent.code === 1005 ? 'idle' : 'error');
-      if (wasActive) toast(reason, closeEvent.code === 1000 || closeEvent.code === 1005 ? 'info' : 'error');
+      setState(isUnexpected ? 'error' : 'idle');
+      if (wasActive) toast(reason, isUnexpected ? 'error' : 'info');
     });
   } catch (error) {
     if (authorizationAbort === abortController) authorizationAbort = null;
@@ -1884,6 +2013,9 @@ function disconnect(reason = bilingual('已由用户断开连接', 'Disconnected
   authorizationAbort = null;
   const activeSocket = socket;
   socket = null;
+  sshReconnectManager?.reset();
+  sshReconnectManager = null;
+  reconnectParams = null;
   stopTimers();
   fileManager.reset();
   fileTree?.setReady(false);
@@ -2190,6 +2322,122 @@ window.addEventListener('beforeunload', () => {
   resetNetworkMetric();
   socket?.close(1000, 'Page closed');
 });
+
+// ── Mobile shortcut key toolbar ────────────────────────────────────────────
+
+/** Mapping from descriptive key names to raw terminal escape sequences. */
+const MOBILE_KEY_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
+  'ctrl-c': '\x03',
+  'ctrl-d': '\x04',
+  'esc':     '\x1b',
+  'tab':     '\x09',
+  'enter':   '\r',
+  'up':      '\x1b[A',
+  'down':    '\x1b[B',
+  'left':    '\x1b[D',
+  'right':   '\x1b[C',
+  'ctrl-z':  '\x1a',
+  'ctrl-l':  '\x0c',
+  'ctrl-r':  '\x12',
+  'ctrl-u':  '\x15',
+  'ctrl-w':  '\x17',
+  'ctrl-k':  '\x0b',
+  'ctrl-a':  '\x01',
+  'ctrl-e':  '\x05',
+  'home':    '\x1b[H',
+  'end':     '\x1b[F',
+  'pgup':    '\x1b[5~',
+  'pgdn':    '\x1b[6~',
+  'delete':  '\x1b[3~',
+});
+
+let mobileToolbarReady = false;
+
+function updateMobileToolbarVisibility(): void {
+  const toolbar = document.getElementById('mobile-toolbar');
+  if (!toolbar) return;
+  // Show toolbar only on touch devices within mobile viewport width.
+  // Aligned with the CSS media query (pointer: coarse) and (max-width: 768px).
+  const isTouchDevice = window.matchMedia('(pointer: coarse) and (max-width: 768px)').matches;
+  const shouldShow = isTouchDevice && connectionState === 'connected';
+  toolbar.hidden = !shouldShow;
+  const panel = document.getElementById('mobile-toolbar-panel');
+  const toggle = document.getElementById('mobile-toolbar-toggle');
+  if (!shouldShow) {
+    if (panel) panel.hidden = true;
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.setAttribute('aria-label', bilingual('打开快捷键工具栏', 'Open shortcut toolbar'));
+      toggle.title = bilingual('快捷键', 'Shortcuts');
+    }
+  } else if (toggle && panel) {
+    // Sync toggle state with current panel visibility
+    // (essential after applyLanguage() rewrites aria-label/title from data-i18n-*)
+    const isExpanded = !panel.hidden;
+    toggle.setAttribute('aria-expanded', String(isExpanded));
+    toggle.setAttribute('aria-label', isExpanded
+      ? bilingual('关闭快捷键工具栏', 'Close shortcut toolbar')
+      : bilingual('打开快捷键工具栏', 'Open shortcut toolbar'));
+    toggle.title = isExpanded
+      ? bilingual('关闭快捷键工具栏', 'Close shortcut toolbar')
+      : bilingual('快捷键', 'Shortcuts');
+  }
+}
+
+function initMobileToolbar(): void {
+  if (mobileToolbarReady) return;
+  mobileToolbarReady = true;
+
+  const toggle = document.getElementById('mobile-toolbar-toggle');
+  const panel = document.getElementById('mobile-toolbar-panel');
+  if (!toggle || !panel) return;
+
+  // Toggle expand / collapse
+  toggle.addEventListener('click', (clickEvent: Event) => {
+    clickEvent.stopPropagation();
+    const wasHidden = panel.hidden;
+    panel.hidden = !wasHidden;
+    toggle.setAttribute('aria-expanded', String(wasHidden));
+    toggle.setAttribute('aria-label', wasHidden
+      ? bilingual('关闭快捷键工具栏', 'Close shortcut toolbar')
+      : bilingual('打开快捷键工具栏', 'Open shortcut toolbar'));
+    toggle.title = wasHidden
+      ? bilingual('关闭快捷键工具栏', 'Close shortcut toolbar')
+      : bilingual('快捷键', 'Shortcuts');
+  });
+
+  // Close panel when tapping outside
+  document.addEventListener('click', (clickEvent: MouseEvent) => {
+    const toolbar = document.getElementById('mobile-toolbar');
+    if (!toolbar || toolbar.hidden) return;
+    if (panel.hidden) return;
+    const target = clickEvent.target as HTMLElement;
+    if (!toolbar.contains(target)) {
+      panel.hidden = true;
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.setAttribute('aria-label', bilingual('打开快捷键工具栏', 'Open shortcut toolbar'));
+      toggle.title = bilingual('快捷键', 'Shortcuts');
+    }
+  });
+
+  // Delegate button clicks — send the escape sequence to the terminal
+  panel.addEventListener('click', (clickEvent: Event) => {
+    const btn = (clickEvent.target as HTMLElement).closest<HTMLElement>('.mobile-key-btn');
+    if (!btn) return;
+    const key = btn.getAttribute('data-key');
+    if (!key) return;
+    const seq = MOBILE_KEY_SEQUENCES[key];
+    if (seq !== undefined && window.wssh) {
+      window.wssh.send(seq);
+    }
+    // Keep the panel open after sending a key so the user can tap
+    // multiple shortcuts without re-expanding every time.
+  });
+
+  // Initial state
+  updateMobileToolbarVisibility();
+}
+
 document.addEventListener('keydown', (keyEvent) => {
   if (keyEvent.key === 'Escape' && panelOpen && !ui.hostKeyDialog.open) {
     setPanelOpen(false);
@@ -2213,6 +2461,7 @@ async function initialize(): Promise<void> {
   ui.sessionSubtitle.textContent = bilingual('选择目标并连接', 'Choose a target and connect');
   ui.eventMessage.textContent = bilingual('Worker 运行时待命', 'Worker runtime standing by');
   initializeCompatibilityAPI();
+  initMobileToolbar();
   const shouldAutoConnect = applyURLParameters();
   requestAnimationFrame(() => {
     fitTerminal(false);
@@ -2231,4 +2480,5 @@ void initialize().catch(() => {
   setState('idle');
   setWorkspaceTab(null);
   initializeCompatibilityAPI();
+  initMobileToolbar();
 });
