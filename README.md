@@ -53,6 +53,13 @@ Cloudflare Worker
 
 ## 部署教程
 
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?repository=https://github.com/cmliu/CF-Workers-WebSSH)
+
+点击上方按钮，授权 Cloudflare 读取你的 GitHub 仓库后即可一键创建并部署 Worker。部署平台会自动读取仓库中的 `wrangler.toml`，并以 `npm run deploy` 作为构建命令完成首次构建与发布。
+
+> [!NOTE]
+> 一键部署需要你对自己的仓库有写入权限。若尚未 Fork，请先 Fork 到个人 GitHub 账号，部署时在仓库选择列表中选中你 Fork 后的仓库即可。
+
 1. Fork 该项目到用户自己的 GitHub 仓库。
 2. 在 `Cloudflare` > `Workers 和 Pages` > `创建应用程序` > `Continue with GitHub` 按钮，选择已 Fork 的项目进行部署。
 3. 在"构建命令"（Build Command）一栏中填入 `npm run deploy`。
